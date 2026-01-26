@@ -1,0 +1,149 @@
+#!/bin/bash
+#
+# account_setup.sh
+# Run as: sudo ./account_setup.sh
+#
+
+#----- safety: must be root ------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  echo "[-] This script must be run as root. Try: sudo $0"
+  exit 1
+fi
+
+echo "=== Account setup script ==="
+
+#----- ask for new username ------------------------------------------
+read -rp "Enter the username to create (e.g. metro): " NEWUSER
+
+if [[ -z "$NEWUSER" ]]; then
+  echo "[-] Username cannot be empty."
+  exit 1
+fi
+
+# check if user already exists
+if id "$NEWUSER" &>/dev/null; then
+  echo "[-] User '$NEWUSER' already exists. Aborting."
+  exit 1
+fi
+
+# you can change these if your lab requires specific IDs
+UID_NUM=999999
+GID_NUM=999999
+
+echo "[*] Creating group '$NEWUSER' (gid=${GID_NUM}) ..."
+if ! getent group "$NEWUSER" &>/dev/null; then
+  if ! groupadd -g "$GID_NUM" "$NEWUSER" 2>/tmp/groupadd.err; then
+    echo "[!] Could not use GID $GID_NUM. Creating group with default GID instead."
+    rm -f /tmp/groupadd.err
+    groupadd "$NEWUSER"
+  fi
+else
+  echo "[!] Group '$NEWUSER' already exists, re-using it."
+fi
+
+# figure out final group id
+GID_FINAL=$(getent group "$NEWUSER" | cut -d: -f3)
+
+echo "[*] Creating user '$NEWUSER' (uid=${UID_NUM}, gid=${GID_FINAL}) ..."
+if ! useradd -u "$UID_NUM" -g "$GID_FINAL" -s /bin/bash -c "$NEWUSER" -m "$NEWUSER" 2>/tmp/useradd.err; then
+  echo "[!] Could not use UID $UID_NUM. Creating user with default UID instead."
+  rm -f /tmp/useradd.err
+  useradd -g "$GID_FINAL" -s /bin/bash -c "$NEWUSER" -m "$NEWUSER"
+fi
+
+#----- set password with confirmation --------------------------------
+echo
+echo "[*] Set password for '$NEWUSER'"
+
+while true; do
+  read -s -p "Enter password: " PASS1
+  echo
+  read -s -p "Confirm password: " PASS2
+  echo
+  if [[ -z "$PASS1" ]]; then
+    echo "[-] Password cannot be empty, try again."
+  elif [[ "$PASS1" != "$PASS2" ]]; then
+    echo "[-] Passwords do not match, try again."
+  else
+    echo "$NEWUSER:$PASS1" | chpasswd
+    unset PASS1 PASS2
+    echo "[+] Password set for '$NEWUSER'."
+    break
+  fi
+done
+
+#----- sudoers entry for new user ------------------------------------
+SUDO_FILE="/etc/sudoers.d/${NEWUSER}"
+echo "[*] Creating sudoers file ${SUDO_FILE}"
+
+cat > "$SUDO_FILE" <<EOF
+Defaults secure_path = /bin:/sbin:/usr/bin:/usr/sbin
+${NEWUSER}    ALL=(ALL) ALL
+EOF
+
+chmod 440 "$SUDO_FILE"
+
+# verify sudoers syntax
+echo "[*] Checking sudoers syntax with visudo ..."
+if visudo -cf "$SUDO_FILE"; then
+  echo "[+] Sudoers file is valid."
+else
+  echo "[!] visudo reported an error. Check ${SUDO_FILE}."
+fi
+
+#----- fix PATH and EDITOR for the new user --------------------------
+HOME_DIR="/home/${NEWUSER}"
+
+echo "[*] Configuring PATH and EDITOR for ${NEWUSER}"
+
+cat > "${HOME_DIR}/.bash_profile" <<'EOF'
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+EDITOR=nano
+export PATH EDITOR
+EOF
+
+ln -sf .bash_profile "${HOME_DIR}/.profile"
+
+chown "${NEWUSER}:${NEWUSER}" "${HOME_DIR}/.bash_profile" "${HOME_DIR}/.profile"
+
+#----- lock root & sysadmin accounts ---------------------------------
+echo
+echo "[*] Locking root and sysadmin accounts (lab hardening step)"
+
+if id root &>/dev/null; then
+  usermod -L root
+  echo "  - root account locked"
+fi
+
+if id sysadmin &>/dev/null; then
+  usermod -L sysadmin
+  chage -E 0 sysadmin
+  echo "  - sysadmin account locked and expired"
+fi
+
+echo
+echo "=== Basic logging & permission hardening ==="
+
+# who is logged in
+who
+
+# save last reboot / login info and root history into your current user's home
+CURRENT_HOME=$(eval echo ~${SUDO_USER:-root})
+
+last > "${CURRENT_HOME}/last_users.txt"
+if [[ -f /root/.bash_history ]]; then
+  cat /root/.bash_history > "${CURRENT_HOME}/root_history.txt"
+fi
+
+# secure those text files so only the owner can read/write them
+chmod 600 "${CURRENT_HOME}"/last_users.txt "${CURRENT_HOME}"/root_history.txt 2>/dev/null || true
+
+echo "[+] Logs written to: ${CURRENT_HOME}/last_users.txt and root_history.txt"
+echo "[+] Permissions set to 600 (owner read/write only) to protect sensitive info."
+
+echo
+echo "Done. New sudo user: ${NEWUSER}"
+echo "You can test with:"
+echo "    su - ${NEWUSER}"
+echo "    sudo -l"
+
